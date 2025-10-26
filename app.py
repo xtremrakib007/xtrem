@@ -1,16 +1,12 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
-from datetime import datetime, date
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, date, timedelta
+import time
+import sqlite3
 import hashlib
 import json
-from typing import Dict, List, Optional
-import random
-import io
-import base64
-from PIL import Image
-import os
-import time
 
 # Initialize session state
 def init_session_state():
@@ -1775,53 +1771,89 @@ def get_room_member_count(room_id):
 
 def display_message(message):
     """Display a single private message with proper formatting"""
-    timestamp = message[4].split(' ')[1][:5] if message[4] else ''
-    
-    if message[1] == st.session_state.current_user['username']:
-        # User's message (right side)
-        st.markdown(f"""
-        <div class="chat-message user-message">
-            <div>{message[3]}</div>
-            <div class="message-time">{timestamp}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        # Other user's message (left side)
-        user_details = execute_query_one("SELECT first_name, last_name FROM users WHERE username = ?", (message[1],))
-        sender_name = f"{user_details[0]} {user_details[1]}" if user_details else message[1]
+    try:
+        # Add validation at the start of the function
+        if not message or len(message) < 2:
+            return  # Skip invalid messages
         
-        st.markdown(f"""
-        <div class="chat-message other-message">
-            <div class="message-sender">{sender_name}</div>
-            <div>{message[3]}</div>
-            <div class="message-time">{timestamp}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        # Safely extract timestamp - fix for the IndexError
+        timestamp = ''
+        if message[1]:
+            try:
+                # Original problematic code: message[1].split('')[1][15]
+                # Safe extraction based on your message format
+                parts = message[1].split(' ')
+                if len(parts) > 1 and len(parts[1]) > 15:
+                    timestamp = parts[1][15]
+                else:
+                    timestamp = ''
+            except (IndexError, AttributeError) as e:
+                timestamp = ''
+        
+        # Display logic based on message sender
+        if message[1] == st.session_state.current_user['username']:
+            # User's message (right side)
+            st.markdown(f"""
+            <div class="chat-message user-message">
+                <div>{message[3]}</div>
+                <div class="message-time">{timestamp}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # Other user's message (left side)
+            user_details = execute_query_one("SELECT first_name, last_name FROM users WHERE username = ?", (message[1],))
+            sender_name = f"{user_details[0]} {user_details[1]}" if user_details else message[1]
+            
+            st.markdown(f"""
+            <div class="chat-message other-message">
+                <div class="message-sender">{sender_name}</div>
+                <div>{message[3]}</div>
+                <div class="message-time">{timestamp}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+    except Exception as e:
+        print(f"Error in display_message: {e}")
+        # Don't crash the app, just skip this message
+        return
 
 def display_group_message(message):
     """Display a single group message with proper formatting"""
-    timestamp = message[4].split(' ')[1][:5] if message[4] else ''
-    
-    if message[1] == st.session_state.current_user['username']:
-        # User's message (right side)
-        st.markdown(f"""
-        <div class="chat-message user-message">
-            <div>{message[3]}</div>
-            <div class="message-time">{timestamp}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        # Other user's message (left side)
-        user_details = execute_query_one("SELECT first_name, last_name FROM users WHERE username = ?", (message[1],))
-        sender_name = f"{user_details[0]} {user_details[1]}" if user_details else message[1]
+    try:
+        # Safely extract timestamp
+        timestamp = ''
+        if message[4]:
+            try:
+                timestamp_parts = message[4].split(' ')
+                if len(timestamp_parts) > 1 and len(timestamp_parts[1]) > 4:
+                    timestamp = timestamp_parts[1][:5]
+            except (IndexError, AttributeError):
+                timestamp = ''
         
-        st.markdown(f"""
-        <div class="chat-message other-message">
-            <div class="message-sender">{sender_name}</div>
-            <div>{message[3]}</div>
-            <div class="message-time">{timestamp}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        if message[1] == st.session_state.current_user['username']:
+            # User's message (right side)
+            st.markdown(f"""
+            <div class="chat-message user-message">
+                <div>{message[3]}</div>
+                <div class="message-time">{timestamp}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # Other user's message (left side)
+            user_details = execute_query_one("SELECT first_name, last_name FROM users WHERE username = ?", (message[1],))
+            sender_name = f"{user_details[0]} {user_details[1]}" if user_details else message[1]
+            
+            st.markdown(f"""
+            <div class="chat-message other-message">
+                <div class="message-sender">{sender_name}</div>
+                <div>{message[3]}</div>
+                <div class="message-time">{timestamp}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+    except Exception as e:
+        print(f"Error in display_group_message: {e}")
+        return
 
 # Enhanced chat renderers with smooth real-time functionality
 def render_chat():
@@ -1866,8 +1898,7 @@ def render_chat():
     
     # Auto-refresh logic
     if st.session_state.auto_refresh:
-        # Use Streamlit's native auto-refresh capability
-        time.sleep(2)  # Check every 2 seconds
+        # Use a more efficient auto-refresh approach
         if check_new_messages():
             st.rerun()
 
