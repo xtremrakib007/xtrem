@@ -222,13 +222,13 @@ def execute_query_one(query, params=()):
 # Role hierarchy for user creation
 role_hierarchy = {
     'admin': ['manager', 'distributor', 'dealer', 'retailer', 'user'],
-    'manager': ['distributor', 'dealer', 'retailer', 'user'],
+    'manager': ['distributor', 'dealer', 'retributor', 'retailer', 'user'],
     'distributor': ['dealer', 'retailer', 'user'],
     'dealer': ['retailer', 'user'],
     'retailer': ['user']
 }
 
-# Approval hierarchy
+# Approval hierarchy - FIXED: Added proper approval flow
 approval_hierarchy = {
     'user': ['admin', 'manager', 'distributor', 'dealer', 'retailer'],
     'retailer': ['admin', 'manager', 'distributor', 'dealer'],
@@ -236,6 +236,14 @@ approval_hierarchy = {
     'distributor': ['admin', 'manager'],
     'manager': ['admin']
 }
+
+# Get users that current user can approve
+def get_approvable_users(current_user_role):
+    approvable_roles = []
+    for role, approvers in approval_hierarchy.items():
+        if current_user_role in approvers:
+            approvable_roles.append(role)
+    return approvable_roles
 
 # Color themes
 def apply_theme():
@@ -279,6 +287,13 @@ def apply_theme():
             background-color: #3d3d3d;
             margin-right: 20%;
         }
+        .approval-item {
+            background-color: #2d2d2d;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 10px;
+            border-left: 5px solid #FFA500;
+        }
         </style>
         """, unsafe_allow_html=True)
     else:
@@ -317,6 +332,14 @@ def apply_theme():
         .other-message {
             background-color: #f5f5f5;
             margin-right: 20%;
+        }
+        .approval-item {
+            background-color: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 10px;
+            border-left: 5px solid #FFA500;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
         }
         </style>
         """, unsafe_allow_html=True)
@@ -362,7 +385,7 @@ def signup_user(role, username, first_name, last_name, email, phone, id_number, 
     user = execute_query_one("SELECT * FROM users WHERE username = ?", (username,))
     
     # Add to pending approvals if not admin
-    if role != 'admin':
+    if role != 'admin' and user:
         approval_data = {
             'username': username,
             'first_name': first_name,
@@ -378,7 +401,7 @@ def signup_user(role, username, first_name, last_name, email, phone, id_number, 
             VALUES (?, ?, ?)
         ''', (user[0], 'new_user', json.dumps(approval_data)))
     
-    return True, "Registration successful"
+    return True, "Registration successful. Waiting for admin approval."
 
 # Page navigation
 def navigate_to(page):
@@ -441,7 +464,20 @@ def render_sidebar():
             
             # Approvals for roles that can approve
             if st.session_state.current_user['role'] in ['admin', 'manager', 'distributor', 'dealer', 'retailer']:
-                if st.button("✅ Approvals", use_container_width=True):
+                # Check if there are pending approvals
+                approvable_roles = get_approvable_users(st.session_state.current_user['role'])
+                pending_users_count = execute_query_one(
+                    "SELECT COUNT(*) FROM users WHERE status = 'pending' AND role IN ({})".format(
+                        ','.join(['?'] * len(approvable_roles))
+                    ), approvable_roles
+                )[0] if approvable_roles else 0
+                
+                pending_changes_count = execute_query_one("SELECT COUNT(*) FROM pending_profile_changes")[0]
+                
+                total_pending = pending_users_count + pending_changes_count
+                
+                approval_text = f"✅ Approvals ({total_pending})" if total_pending > 0 else "✅ Approvals"
+                if st.button(approval_text, use_container_width=True):
                     navigate_to('approvals')
 
 # Page renderers
@@ -524,7 +560,7 @@ def render_dashboard():
             """, unsafe_allow_html=True)
         
         with col3:
-            total_sales = execute_query_one("SELECT COALESCE(SUM(total), 0) FROM orders")[0]
+            total_sales = execute_query_one("SELECT COALESCE(SUM(total), 0) FROM orders")[0] or 0
             st.markdown(f"""
             <div class="metric-card">
                 <h3>Total Sales</h3>
@@ -557,6 +593,23 @@ def render_dashboard():
         with cols[2]:
             if st.button("🛒 Create Order", use_container_width=True):
                 navigate_to('orders')
+    
+    # Show pending approvals notification for admins and managers
+    if st.session_state.current_user['role'] in ['admin', 'manager', 'distributor', 'dealer', 'retailer']:
+        approvable_roles = get_approvable_users(st.session_state.current_user['role'])
+        if approvable_roles:
+            pending_users_count = execute_query_one(
+                "SELECT COUNT(*) FROM users WHERE status = 'pending' AND role IN ({})".format(
+                    ','.join(['?'] * len(approvable_roles))
+                ), approvable_roles
+            )[0] if approvable_roles else 0
+            
+            pending_changes_count = execute_query_one("SELECT COUNT(*) FROM pending_profile_changes")[0]
+            
+            total_pending = pending_users_count + pending_changes_count
+            
+            if total_pending > 0:
+                st.warning(f"🔔 You have {total_pending} pending approval(s)! Click on 'Approvals' in the sidebar to review them.")
 
 def render_profile():
     st.header("👤 Profile Management")
@@ -1072,38 +1125,56 @@ def render_settings():
 def render_approvals():
     st.header("✅ Pending Approvals")
     
-    # Pending user approvals
-    st.subheader("👤 Pending User Approvals")
-    pending_users = execute_query("SELECT * FROM users WHERE status = 'pending'", fetch=True)
+    current_user_role = st.session_state.current_user['role']
+    approvable_roles = get_approvable_users(current_user_role)
+    
+    if not approvable_roles:
+        st.warning("You don't have permission to approve any users.")
+        return
+    
+    # Pending user approvals - FIXED: Now properly shows users that current user can approve
+    st.subheader("👤 Pending User Registrations")
+    
+    if approvable_roles:
+        pending_users = execute_query(
+            "SELECT * FROM users WHERE status = 'pending' AND role IN ({})".format(
+                ','.join(['?'] * len(approvable_roles))
+            ), approvable_roles, fetch=True
+        )
+    else:
+        pending_users = []
     
     if pending_users:
         for user in pending_users:
-            with st.expander(f"{user[2]} {user[3]} ({user[1]}) - {user[8]}"):
-                st.write(f"**Email:** {user[4]}")
-                st.write(f"**Phone:** {user[5]}")
-                st.write(f"**ID Number:** {user[6]}")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("Approve", key=f"approve_{user[0]}", use_container_width=True):
-                        if user[8] in approval_hierarchy and st.session_state.current_user['role'] in approval_hierarchy[user[8]]:
-                            execute_query('UPDATE users SET status = ? WHERE id = ?', ('approved', user[0]))
-                            st.success(f"User {user[1]} approved successfully")
-                            st.rerun()
-                        else:
-                            st.error("You are not allowed to approve this user")
-                with col2:
-                    if st.button("Reject", key=f"reject_{user[0]}", use_container_width=True):
-                        if user[8] in approval_hierarchy and st.session_state.current_user['role'] in approval_hierarchy[user[8]]:
-                            execute_query('UPDATE users SET status = ? WHERE id = ?', ('rejected', user[0]))
-                            st.success(f"User {user[1]} rejected")
-                            st.rerun()
-                        else:
-                            st.error("You are not allowed to reject this user")
+            st.markdown(f"""
+            <div class="approval-item">
+                <h4>{user[2]} {user[3]} ({user[1]}) - {user[8]}</h4>
+                <p><strong>Email:</strong> {user[4]}</p>
+                <p><strong>Phone:</strong> {user[5]}</p>
+                <p><strong>ID Number:</strong> {user[6]}</p>
+                <p><strong>Registered:</strong> {user[10]}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Approve", key=f"approve_{user[0]}", use_container_width=True):
+                    execute_query('UPDATE users SET status = ? WHERE id = ?', ('approved', user[0]))
+                    # Remove from pending approvals table
+                    execute_query('DELETE FROM pending_approvals WHERE user_id = ?', (user[0],))
+                    st.success(f"User {user[1]} approved successfully")
+                    st.rerun()
+            with col2:
+                if st.button("Reject", key=f"reject_{user[0]}", use_container_width=True):
+                    execute_query('UPDATE users SET status = ? WHERE id = ?', ('rejected', user[0]))
+                    # Remove from pending approvals table
+                    execute_query('DELETE FROM pending_approvals WHERE user_id = ?', (user[0],))
+                    st.success(f"User {user[1]} rejected")
+                    st.rerun()
     else:
-        st.info("No pending user approvals")
+        st.info("No pending user registrations")
     
-    # Pending profile changes
+    # Pending profile changes - FIXED: Now properly checks approval permissions
     st.subheader("📝 Pending Profile Changes")
     pending_changes = execute_query("SELECT * FROM pending_profile_changes", fetch=True)
     
@@ -1111,11 +1182,15 @@ def render_approvals():
         for change in pending_changes:
             user = execute_query_one("SELECT * FROM users WHERE username = ?", (change[1],))
             
-            with st.expander(f"Profile changes for {change[1]}"):
-                if user:
-                    st.write(f"**Current User:** {user[2]} {user[3]} ({user[8]})")
+            if user and user[8] in approvable_roles:  # Only show if current user can approve this role
+                st.markdown(f"""
+                <div class="approval-item">
+                    <h4>Profile changes for {change[1]}</h4>
+                    <p><strong>Current User:</strong> {user[2]} {user[3]} ({user[8]})</p>
+                    <p><strong>Proposed Changes:</strong></p>
+                </div>
+                """, unsafe_allow_html=True)
                 
-                st.write("**Proposed Changes:**")
                 if change[2]:
                     st.write(f"- First Name: {change[2]}")
                 if change[3]:
@@ -1132,50 +1207,48 @@ def render_approvals():
                 col1, col2 = st.columns(2)
                 with col1:
                     if st.button("Approve", key=f"approve_change_{change[0]}", use_container_width=True):
-                        if user and user[8] in approval_hierarchy and st.session_state.current_user['role'] in approval_hierarchy[user[8]]:
-                            # Apply changes
-                            update_fields = []
-                            update_values = []
-                            
-                            if change[2]:
-                                update_fields.append("first_name = ?")
-                                update_values.append(change[2])
-                            if change[3]:
-                                update_fields.append("last_name = ?")
-                                update_values.append(change[3])
-                            if change[4]:
-                                update_fields.append("email = ?")
-                                update_values.append(change[4])
-                            if change[5]:
-                                update_fields.append("phone = ?")
-                                update_values.append(change[5])
-                            if change[6]:
-                                update_fields.append("id_number = ?")
-                                update_values.append(change[6])
-                            if change[7]:
-                                update_fields.append("password = ?")
-                                update_values.append(change[7])
-                            
-                            update_values.append(change[1])
-                            
-                            if update_fields:
-                                execute_query(f'''
-                                    UPDATE users SET {', '.join(update_fields)} 
-                                    WHERE username = ?
-                                ''', update_values)
-                            
-                            # Remove pending change
-                            execute_query('DELETE FROM pending_profile_changes WHERE id = ?', (change[0],))
-                            
-                            st.success("Profile changes approved")
-                            st.rerun()
-                        else:
-                            st.error("You are not allowed to approve these changes")
+                        # Apply changes
+                        update_fields = []
+                        update_values = []
+                        
+                        if change[2]:
+                            update_fields.append("first_name = ?")
+                            update_values.append(change[2])
+                        if change[3]:
+                            update_fields.append("last_name = ?")
+                            update_values.append(change[3])
+                        if change[4]:
+                            update_fields.append("email = ?")
+                            update_values.append(change[4])
+                        if change[5]:
+                            update_fields.append("phone = ?")
+                            update_values.append(change[5])
+                        if change[6]:
+                            update_fields.append("id_number = ?")
+                            update_values.append(change[6])
+                        if change[7]:
+                            update_fields.append("password = ?")
+                            update_values.append(change[7])
+                        
+                        update_values.append(change[1])
+                        
+                        if update_fields:
+                            execute_query(f'''
+                                UPDATE users SET {', '.join(update_fields)} 
+                                WHERE username = ?
+                            ''', update_values)
+                        
+                        # Remove pending change
+                        execute_query('DELETE FROM pending_profile_changes WHERE id = ?', (change[0],))
+                        
+                        st.success("Profile changes approved")
+                        st.rerun()
                 with col2:
                     if st.button("Reject", key=f"reject_change_{change[0]}", use_container_width=True):
                         execute_query('DELETE FROM pending_profile_changes WHERE id = ?', (change[0],))
                         st.success("Profile changes rejected")
                         st.rerun()
+                st.divider()
     else:
         st.info("No pending profile changes")
 
