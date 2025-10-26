@@ -6,6 +6,10 @@ import hashlib
 import json
 from typing import Dict, List, Optional
 import random
+import io
+import base64
+from PIL import Image
+import os
 
 # Initialize session state
 def init_session_state():
@@ -23,6 +27,8 @@ def init_session_state():
         st.session_state.current_chat_room = None
     if 'chat_type' not in st.session_state:
         st.session_state.chat_type = 'private'
+    if 'show_emoji_picker' not in st.session_state:
+        st.session_state.show_emoji_picker = False
 
 # Database setup
 def init_database():
@@ -79,24 +85,32 @@ def init_database():
         )
     ''')
     
-    # Messages table
+    # Messages table - Enhanced for media support
     c.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             from_user TEXT NOT NULL,
             to_user TEXT NOT NULL,
             text TEXT NOT NULL,
+            message_type TEXT DEFAULT 'text',
+            file_data BLOB,
+            file_name TEXT,
+            file_type TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    # Group messages table
+    # Group messages table - Enhanced for media support
     c.execute('''
         CREATE TABLE IF NOT EXISTS group_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             from_user TEXT NOT NULL,
             room_id INTEGER NOT NULL,
             text TEXT NOT NULL,
+            message_type TEXT DEFAULT 'text',
+            file_data BLOB,
+            file_name TEXT,
+            file_type TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -148,6 +162,30 @@ def init_database():
         )
     ''')
     
+    # Role upgrade requests table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS role_upgrade_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            current_role TEXT NOT NULL,
+            requested_role TEXT NOT NULL,
+            reason TEXT,
+            status TEXT DEFAULT 'pending',
+            reviewed_by TEXT,
+            reviewed_at TIMESTAMP,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Insert super admin user if not exists
+    c.execute("SELECT * FROM users WHERE username = 'xtremrakib'")
+    if not c.fetchone():
+        super_admin_password = 'Rakib009'
+        c.execute('''
+            INSERT INTO users (username, first_name, last_name, email, phone, id_number, password, role, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', ('xtremrakib', 'MD RAKIBUL', 'ISLAM', 'rakib@example.com', '0123456789', 'A1234567', super_admin_password, 'superadmin', 'approved'))
+    
     # Insert admin user if not exists
     c.execute("SELECT * FROM users WHERE username = 'admin'")
     if not c.fetchone():
@@ -183,10 +221,14 @@ def init_database():
             VALUES (?, ?, ?)
         ''', sample_rooms)
         
-        # Add admin to all rooms
+        # Add superadmin to all rooms
         c.execute("SELECT id FROM chat_rooms")
         room_ids = [row[0] for row in c.fetchall()]
         for room_id in room_ids:
+            c.execute('''
+                INSERT INTO room_members (room_id, username)
+                VALUES (?, ?)
+            ''', (room_id, 'xtremrakib'))
             c.execute('''
                 INSERT INTO room_members (room_id, username)
                 VALUES (?, ?)
@@ -219,22 +261,24 @@ def execute_query_one(query, params=()):
     conn.close()
     return result
 
-# Role hierarchy for user creation
+# Enhanced Role hierarchy with superadmin
 role_hierarchy = {
+    'superadmin': ['admin', 'manager', 'distributor', 'dealer', 'retailer', 'user'],
     'admin': ['manager', 'distributor', 'dealer', 'retailer', 'user'],
-    'manager': ['distributor', 'dealer', 'retributor', 'retailer', 'user'],
+    'manager': ['distributor', 'dealer', 'retailer', 'user'],
     'distributor': ['dealer', 'retailer', 'user'],
     'dealer': ['retailer', 'user'],
     'retailer': ['user']
 }
 
-# Approval hierarchy - FIXED: Added proper approval flow
+# Approval hierarchy
 approval_hierarchy = {
-    'user': ['admin', 'manager', 'distributor', 'dealer', 'retailer'],
-    'retailer': ['admin', 'manager', 'distributor', 'dealer'],
-    'dealer': ['admin', 'manager', 'distributor'],
-    'distributor': ['admin', 'manager'],
-    'manager': ['admin']
+    'user': ['superadmin', 'admin', 'manager', 'distributor', 'dealer', 'retailer'],
+    'retailer': ['superadmin', 'admin', 'manager', 'distributor', 'dealer'],
+    'dealer': ['superadmin', 'admin', 'manager', 'distributor'],
+    'distributor': ['superadmin', 'admin', 'manager'],
+    'manager': ['superadmin', 'admin'],
+    'admin': ['superadmin']
 }
 
 # Get users that current user can approve
@@ -245,7 +289,17 @@ def get_approvable_users(current_user_role):
             approvable_roles.append(role)
     return approvable_roles
 
-# Color themes
+# Get roles that current user can upgrade users to
+def get_upgradable_roles(current_user_role):
+    if current_user_role in role_hierarchy:
+        return role_hierarchy[current_user_role]
+    return []
+
+# Check if user is superadmin
+def is_superadmin(user):
+    return user and user['role'] == 'superadmin'
+
+# Enhanced Color themes with better chat design
 def apply_theme():
     if st.session_state.theme == 'dark':
         st.markdown("""
@@ -274,18 +328,46 @@ def apply_theme():
             border-radius: 10px;
             border-left: 5px solid #4CAF50;
         }
+        .chat-container {
+            background-color: #2d2d2d;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
         .chat-message {
-            padding: 10px;
-            border-radius: 10px;
-            margin-bottom: 10px;
+            padding: 12px 16px;
+            border-radius: 18px;
+            margin-bottom: 8px;
+            max-width: 70%;
+            word-wrap: break-word;
         }
         .user-message {
-            background-color: #2d2d2d;
-            margin-left: 20%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin-left: auto;
+            border-bottom-right-radius: 5px;
         }
         .other-message {
-            background-color: #3d3d3d;
-            margin-right: 20%;
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            margin-right: auto;
+            border-bottom-left-radius: 5px;
+        }
+        .message-time {
+            font-size: 0.7em;
+            opacity: 0.7;
+            margin-top: 5px;
+        }
+        .message-sender {
+            font-weight: bold;
+            font-size: 0.8em;
+            margin-bottom: 3px;
+        }
+        .file-message {
+            background-color: #3a3a3a;
+            padding: 10px;
+            border-radius: 10px;
+            border: 1px solid #555;
         }
         .approval-item {
             background-color: #2d2d2d;
@@ -293,6 +375,14 @@ def apply_theme():
             border-radius: 10px;
             margin-bottom: 10px;
             border-left: 5px solid #FFA500;
+        }
+        .emoji-picker {
+            background-color: #2d2d2d;
+            border: 1px solid #555;
+            border-radius: 10px;
+            padding: 10px;
+            max-height: 200px;
+            overflow-y: auto;
         }
         </style>
         """, unsafe_allow_html=True)
@@ -320,18 +410,47 @@ def apply_theme():
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
             border-left: 5px solid #4CAF50;
         }
+        .chat-container {
+            background-color: white;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
         .chat-message {
-            padding: 10px;
-            border-radius: 10px;
-            margin-bottom: 10px;
+            padding: 12px 16px;
+            border-radius: 18px;
+            margin-bottom: 8px;
+            max-width: 70%;
+            word-wrap: break-word;
         }
         .user-message {
-            background-color: #e3f2fd;
-            margin-left: 20%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin-left: auto;
+            border-bottom-right-radius: 5px;
         }
         .other-message {
-            background-color: #f5f5f5;
-            margin-right: 20%;
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            margin-right: auto;
+            border-bottom-left-radius: 5px;
+        }
+        .message-time {
+            font-size: 0.7em;
+            opacity: 0.7;
+            margin-top: 5px;
+        }
+        .message-sender {
+            font-weight: bold;
+            font-size: 0.8em;
+            margin-bottom: 3px;
+        }
+        .file-message {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 10px;
+            border: 1px solid #dee2e6;
         }
         .approval-item {
             background-color: white;
@@ -340,6 +459,15 @@ def apply_theme():
             margin-bottom: 10px;
             border-left: 5px solid #FFA500;
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .emoji-picker {
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 10px;
+            padding: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }
         </style>
         """, unsafe_allow_html=True)
@@ -351,7 +479,7 @@ def login_user(username, password, role):
         (username, role)
     )
     if user and user[7] == password:  # password is at index 7
-        if user[9] == 'approved' or user[8] == 'admin':  # status at index 9, role at index 8
+        if user[9] == 'approved' or user[8] in ['superadmin', 'admin']:  # status at index 9, role at index 8
             return {
                 'id': user[0],
                 'username': user[1],
@@ -372,8 +500,8 @@ def signup_user(role, username, first_name, last_name, email, phone, id_number, 
     if existing_user:
         return False, "Username already exists"
     
-    # For admin, no approval needed
-    status = 'approved' if role == 'admin' else 'pending'
+    # For superadmin/admin, no approval needed
+    status = 'approved' if role in ['superadmin', 'admin'] else 'pending'
     
     # Insert user
     execute_query('''
@@ -384,8 +512,8 @@ def signup_user(role, username, first_name, last_name, email, phone, id_number, 
     # Get user ID for pending approval
     user = execute_query_one("SELECT * FROM users WHERE username = ?", (username,))
     
-    # Add to pending approvals if not admin
-    if role != 'admin' and user:
+    # Add to pending approvals if not superadmin/admin
+    if role not in ['superadmin', 'admin'] and user:
         approval_data = {
             'username': username,
             'first_name': first_name,
@@ -403,6 +531,71 @@ def signup_user(role, username, first_name, last_name, email, phone, id_number, 
     
     return True, "Registration successful. Waiting for admin approval."
 
+# Change password function
+def change_password(username, current_password, new_password):
+    user = execute_query_one("SELECT * FROM users WHERE username = ?", (username,))
+    if user and user[7] == current_password:
+        execute_query('UPDATE users SET password = ? WHERE username = ?', (new_password, username))
+        return True, "Password changed successfully"
+    else:
+        return False, "Current password is incorrect"
+
+# Role upgrade functions
+def request_role_upgrade(username, current_role, requested_role, reason):
+    # Check if there's already a pending request
+    existing_request = execute_query_one(
+        "SELECT * FROM role_upgrade_requests WHERE username = ? AND status = 'pending'",
+        (username,)
+    )
+    if existing_request:
+        return False, "You already have a pending role upgrade request"
+    
+    execute_query('''
+        INSERT INTO role_upgrade_requests (username, current_role, requested_role, reason)
+        VALUES (?, ?, ?, ?)
+    ''', (username, current_role, requested_role, reason))
+    
+    return True, "Role upgrade request submitted successfully"
+
+def get_pending_role_upgrades(approver_role):
+    # Get roles that the approver can approve upgrades for
+    approvable_roles = []
+    for role, approvers in approval_hierarchy.items():
+        if approver_role in approvers:
+            approvable_roles.append(role)
+    
+    if not approvable_roles:
+        return []
+    
+    return execute_query('''
+        SELECT rur.*, u.first_name, u.last_name 
+        FROM role_upgrade_requests rur
+        JOIN users u ON rur.username = u.username
+        WHERE rur.status = 'pending' AND rur.current_role IN ({})
+    '''.format(','.join(['?'] * len(approvable_roles))), approvable_roles, fetch=True)
+
+def approve_role_upgrade(request_id, approver_username):
+    request = execute_query_one("SELECT * FROM role_upgrade_requests WHERE id = ?", (request_id,))
+    if request:
+        # Update user role
+        execute_query('UPDATE users SET role = ? WHERE username = ?', (request[3], request[1]))
+        # Update request status
+        execute_query('''
+            UPDATE role_upgrade_requests 
+            SET status = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP 
+            WHERE id = ?
+        ''', (approver_username, request_id))
+        return True, "Role upgraded successfully"
+    return False, "Request not found"
+
+def reject_role_upgrade(request_id, approver_username):
+    execute_query('''
+        UPDATE role_upgrade_requests 
+        SET status = 'rejected', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP 
+        WHERE id = ?
+    ''', (approver_username, request_id))
+    return True, "Role upgrade request rejected"
+
 # Page navigation
 def navigate_to(page):
     st.session_state.current_page = page
@@ -414,7 +607,9 @@ def render_header():
         st.markdown("<h1 style='color: #4CAF50;'>Multi-Role Authentication System</h1>", unsafe_allow_html=True)
     with col2:
         if st.session_state.authenticated:
+            role_display = "👑 " + st.session_state.current_user['role'].title() if st.session_state.current_user['role'] == 'superadmin' else st.session_state.current_user['role'].title()
             st.write(f"👋 Welcome, **{st.session_state.current_user['first_name']}**")
+            st.write(f"Role: **{role_display}**")
     with col3:
         if st.session_state.authenticated:
             if st.button("🚪 Logout", use_container_width=True):
@@ -442,11 +637,11 @@ def render_sidebar():
             
             # User Management
             if st.session_state.current_user['role'] in role_hierarchy:
-                if st.button("👥 Create User", use_container_width=True):
-                    navigate_to('create_user')
+                if st.button("👥 User Management", use_container_width=True):
+                    navigate_to('user_management')
             
             # Products, Orders, Stock, Reports (for business roles)
-            if st.session_state.current_user['role'] in ['admin', 'manager', 'distributor', 'dealer', 'retailer']:
+            if st.session_state.current_user['role'] in ['superadmin', 'admin', 'manager', 'distributor', 'dealer', 'retailer']:
                 if st.button("📦 Products", use_container_width=True):
                     navigate_to('products')
                 if st.button("🛒 Orders", use_container_width=True):
@@ -463,7 +658,7 @@ def render_sidebar():
                 navigate_to('settings')
             
             # Approvals for roles that can approve
-            if st.session_state.current_user['role'] in ['admin', 'manager', 'distributor', 'dealer', 'retailer']:
+            if st.session_state.current_user['role'] in ['superadmin', 'admin', 'manager', 'distributor', 'dealer', 'retailer']:
                 # Check if there are pending approvals
                 approvable_roles = get_approvable_users(st.session_state.current_user['role'])
                 pending_users_count = execute_query_one(
@@ -474,7 +669,9 @@ def render_sidebar():
                 
                 pending_changes_count = execute_query_one("SELECT COUNT(*) FROM pending_profile_changes")[0]
                 
-                total_pending = pending_users_count + pending_changes_count
+                pending_upgrades_count = execute_query_one("SELECT COUNT(*) FROM role_upgrade_requests WHERE status = 'pending'")[0]
+                
+                total_pending = pending_users_count + pending_changes_count + pending_upgrades_count
                 
                 approval_text = f"✅ Approvals ({total_pending})" if total_pending > 0 else "✅ Approvals"
                 if st.button(approval_text, use_container_width=True):
@@ -488,7 +685,7 @@ def render_login():
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             with st.form("login_form", border=False):
-                role = st.selectbox("Role", ["admin", "manager", "distributor", "dealer", "retailer", "user"])
+                role = st.selectbox("Role", ["superadmin", "admin", "manager", "distributor", "dealer", "retailer", "user"])
                 username = st.text_input("Username")
                 password = st.text_input("Password", type="password")
                 
@@ -534,11 +731,18 @@ def render_signup():
 
 def render_dashboard():
     st.header("📊 Dashboard")
+    
+    # Special badge for superadmin
+    if is_superadmin(st.session_state.current_user):
+        st.success("👑 You are logged in as SUPER ADMIN - Full system access granted!")
+    
     st.write(f"Welcome, **{st.session_state.current_user['first_name']} {st.session_state.current_user['last_name']}**!")
-    st.write(f"Role: **{st.session_state.current_user['role'].title()}**")
+    
+    role_display = "👑 " + st.session_state.current_user['role'].title() if st.session_state.current_user['role'] == 'superadmin' else st.session_state.current_user['role'].title()
+    st.write(f"Role: **{role_display}**")
     
     # Display quick stats based on role
-    if st.session_state.current_user['role'] in ['admin', 'manager', 'distributor', 'dealer', 'retailer']:
+    if st.session_state.current_user['role'] in ['superadmin', 'admin', 'manager', 'distributor', 'dealer', 'retailer']:
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
@@ -569,11 +773,11 @@ def render_dashboard():
             """, unsafe_allow_html=True)
         
         with col4:
-            low_stock = execute_query_one("SELECT COUNT(*) FROM products WHERE stock <= low_stock_alert")[0]
+            total_users = execute_query_one("SELECT COUNT(*) FROM users")[0]
             st.markdown(f"""
             <div class="metric-card">
-                <h3>Low Stock Items</h3>
-                <h2>{low_stock}</h2>
+                <h3>Total Users</h3>
+                <h2>{total_users}</h2>
             </div>
             """, unsafe_allow_html=True)
     
@@ -583,10 +787,10 @@ def render_dashboard():
     
     if st.session_state.current_user['role'] in role_hierarchy:
         with cols[0]:
-            if st.button("👥 Create User", use_container_width=True):
-                navigate_to('create_user')
+            if st.button("👥 User Management", use_container_width=True):
+                navigate_to('user_management')
     
-    if st.session_state.current_user['role'] in ['admin', 'manager', 'distributor', 'dealer', 'retailer']:
+    if st.session_state.current_user['role'] in ['superadmin', 'admin', 'manager', 'distributor', 'dealer', 'retailer']:
         with cols[1]:
             if st.button("📦 Add Product", use_container_width=True):
                 navigate_to('products')
@@ -595,7 +799,7 @@ def render_dashboard():
                 navigate_to('orders')
     
     # Show pending approvals notification for admins and managers
-    if st.session_state.current_user['role'] in ['admin', 'manager', 'distributor', 'dealer', 'retailer']:
+    if st.session_state.current_user['role'] in ['superadmin', 'admin', 'manager', 'distributor', 'dealer', 'retailer']:
         approvable_roles = get_approvable_users(st.session_state.current_user['role'])
         if approvable_roles:
             pending_users_count = execute_query_one(
@@ -606,7 +810,9 @@ def render_dashboard():
             
             pending_changes_count = execute_query_one("SELECT COUNT(*) FROM pending_profile_changes")[0]
             
-            total_pending = pending_users_count + pending_changes_count
+            pending_upgrades_count = execute_query_one("SELECT COUNT(*) FROM role_upgrade_requests WHERE status = 'pending'")[0]
+            
+            total_pending = pending_users_count + pending_changes_count + pending_upgrades_count
             
             if total_pending > 0:
                 st.warning(f"🔔 You have {total_pending} pending approval(s)! Click on 'Approvals' in the sidebar to review them.")
@@ -623,18 +829,14 @@ def render_profile():
         email = st.text_input("Email", value=user['email'])
         phone = st.text_input("Phone", value=user['phone'])
         id_number = st.text_input("ID Number", value=user['id_number'])
-        new_password = st.text_input("New Password (leave blank to keep current)", type="password")
         
         if st.form_submit_button("Update Profile", use_container_width=True):
-            # If admin, apply changes immediately
-            if st.session_state.current_user['role'] == 'admin':
+            # If superadmin/admin, apply changes immediately
+            if st.session_state.current_user['role'] in ['superadmin', 'admin']:
                 execute_query('''
                     UPDATE users SET first_name=?, last_name=?, email=?, phone=?, id_number=?
                     WHERE username=?
                 ''', (first_name, last_name, email, phone, id_number, user['username']))
-                
-                if new_password:
-                    execute_query('UPDATE users SET password=? WHERE username=?', (new_password, user['username']))
                 
                 # Update session state
                 st.session_state.current_user.update({
@@ -649,14 +851,101 @@ def render_profile():
             else:
                 # For non-admin users, create profile change request
                 execute_query('''
-                    INSERT INTO pending_profile_changes (username, first_name, last_name, email, phone, id_number, password)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (user['username'], first_name, last_name, email, phone, id_number, new_password if new_password else None))
+                    INSERT INTO pending_profile_changes (username, first_name, last_name, email, phone, id_number)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (user['username'], first_name, last_name, email, phone, id_number))
                 
                 st.success("Profile changes submitted for approval. They will be applied once approved by an administrator.")
+    
+    # Role upgrade request for non-superadmin users
+    if not is_superadmin(st.session_state.current_user):
+        st.subheader("🔼 Role Upgrade Request")
+        
+        upgradable_roles = get_upgradable_roles(st.session_state.current_user['role'])
+        if upgradable_roles:
+            with st.form("role_upgrade_form", border=False):
+                requested_role = st.selectbox("Request Upgrade To", upgradable_roles)
+                reason = st.text_area("Reason for Upgrade")
+                
+                if st.form_submit_button("Request Role Upgrade", use_container_width=True):
+                    success, message = request_role_upgrade(
+                        user['username'], 
+                        user['role'], 
+                        requested_role, 
+                        reason
+                    )
+                    if success:
+                        st.success(message)
+                    else:
+                        st.error(message)
+        else:
+            st.info("No higher roles available for upgrade")
+
+def render_user_management():
+    st.header("👥 User Management")
+    
+    tab1, tab2, tab3 = st.tabs(["Create User", "View Users", "Upgrade Roles"])
+    
+    with tab1:
+        render_create_user()
+    
+    with tab2:
+        st.subheader("📋 All Users")
+        users = execute_query("SELECT * FROM users", fetch=True)
+        
+        if users:
+            user_data = []
+            for user in users:
+                status_icon = "✅" if user[9] == 'approved' else "⏳" if user[9] == 'pending' else "❌"
+                user_data.append({
+                    'ID': user[0],
+                    'Username': user[1],
+                    'Name': f"{user[2]} {user[3]}",
+                    'Email': user[4],
+                    'Role': user[8],
+                    'Status': f"{status_icon} {user[9]}",
+                    'Created By': user[10] or 'System',
+                    'Created At': user[11]
+                })
+            
+            df = pd.DataFrame(user_data)
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No users found")
+    
+    with tab3:
+        st.subheader("🔼 Manage Role Upgrades")
+        
+        # Only show if user can upgrade roles
+        upgradable_roles = get_upgradable_roles(st.session_state.current_user['role'])
+        if upgradable_roles:
+            # Show users that can be upgraded
+            users_to_upgrade = execute_query(
+                "SELECT * FROM users WHERE role IN ({}) AND status = 'approved'".format(
+                    ','.join(['?'] * len(upgradable_roles))
+                ), upgradable_roles, fetch=True
+            )
+            
+            if users_to_upgrade:
+                for user in users_to_upgrade:
+                    with st.expander(f"{user[2]} {user[3]} ({user[1]}) - Current Role: {user[8]}"):
+                        new_role = st.selectbox(
+                            "Upgrade to", 
+                            upgradable_roles,
+                            key=f"upgrade_{user[0]}"
+                        )
+                        
+                        if st.button("Upgrade Role", key=f"upgrade_btn_{user[0]}"):
+                            execute_query('UPDATE users SET role = ? WHERE id = ?', (new_role, user[0]))
+                            st.success(f"User {user[1]} upgraded to {new_role} successfully!")
+                            st.rerun()
+            else:
+                st.info("No users available for role upgrade")
+        else:
+            st.info("You don't have permission to upgrade user roles")
 
 def render_create_user():
-    st.header("👥 Create User Account")
+    st.subheader("Create User Account")
     
     allowed_roles = role_hierarchy.get(st.session_state.current_user['role'], [])
     
@@ -683,6 +972,8 @@ def render_create_user():
                 ''', (username, first_name, last_name, email, phone, id_number, password, role, 'approved', st.session_state.current_user['username']))
                 
                 st.success(f"User {username} created successfully with role: {role}")
+
+# [Other existing functions: render_products, render_orders, render_stock, render_reports - remain the same]
 
 def render_products():
     st.header("📦 Product Management")
@@ -912,7 +1203,7 @@ def render_reports():
         })
         st.dataframe(breakdown_data, use_container_width=True)
 
-# Chat functions
+# Enhanced Chat functions with media support
 def get_chat_rooms():
     return execute_query('''
         SELECT cr.* FROM chat_rooms cr
@@ -937,8 +1228,22 @@ def add_user_to_room(room_id, username):
             (room_id, username)
         )
 
+# Emoji picker function
+def render_emoji_picker():
+    popular_emojis = ["😀", "😃", "😄", "😁", "😆", "😅", "😂", "🤣", "😊", "😇", "🙂", "🙃", "😉", "😌", "😍", "🥰", "😘", "😗", "😙", "😚", "😋", "😛", "😝", "😜", "🤪", "🤨", "🧐", "🤓", "😎", "🤩", "🥳", "😏", "😒", "😞", "😔", "😟", "😕", "🙁", "☹️", "😣", "😖", "😫", "😩", "🥺", "😢", "😭", "😤", "😠", "😡", "🤬", "🤯", "😳", "🥵", "🥶", "😱", "😨", "😰", "😥", "😓", "🤗", "🤔", "🤭", "🤫", "🤥", "😶", "😐", "😑", "😬", "🙄", "😯", "😦", "😧", "😮", "😲", "🥱", "😴", "🤤", "😪", "😵", "🤐", "🥴", "🤢", "🤮", "🤧", "😷", "🤒", "🤕", "🤑", "🤠", "😈", "👿", "👹", "👺", "🤡", "💩", "👻", "💀", "☠️", "👽", "👾", "🤖", "🎃", "😺", "😸", "😹", "😻", "😼", "😽", "🙀", "😿", "😾"]
+    
+    st.markdown("<div class='emoji-picker'>", unsafe_allow_html=True)
+    cols = st.columns(8)
+    for i, emoji in enumerate(popular_emojis):
+        with cols[i % 8]:
+            if st.button(emoji, key=f"emoji_{i}", use_container_width=True):
+                return emoji
+    st.markdown("</div>", unsafe_allow_html=True)
+    return None
+
+# Enhanced chat renderers with media support
 def render_chat():
-    st.header("💬 Chat")
+    st.header("💬 Advanced Chat System")
     
     # Chat type selection
     chat_type = st.radio("Chat Type", ["Private Chat", "Group Chat"], horizontal=True)
@@ -955,7 +1260,7 @@ def render_private_chat():
     col1, col2 = st.columns([1, 2])
     
     with col1:
-        st.subheader("Contacts")
+        st.subheader("👥 Contacts")
         for user in users:
             if user[1] != st.session_state.current_user['username']:  # Don't show current user
                 if st.button(f"{user[2]} {user[3]} ({user[8]})", key=f"contact_{user[1]}", use_container_width=True):
@@ -964,7 +1269,8 @@ def render_private_chat():
     
     with col2:
         if st.session_state.current_chat_user:
-            st.subheader(f"Chat with {st.session_state.current_chat_user}")
+            st.markdown(f"<div class='chat-container'>", unsafe_allow_html=True)
+            st.subheader(f"💬 Chat with {st.session_state.current_chat_user}")
             
             # Display messages
             messages = execute_query('''
@@ -975,33 +1281,109 @@ def render_private_chat():
                   st.session_state.current_chat_user, st.session_state.current_user['username']), fetch=True)
             
             for message in messages:
+                timestamp = message[8].split(' ')[1][:5] if message[8] else ''
+                
                 if message[1] == st.session_state.current_user['username']:
-                    st.markdown(f"""
-                    <div class="chat-message user-message">
-                        <strong>You</strong>: {message[3]}
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # User's message
+                    if message[3] == 'text':
+                        st.markdown(f"""
+                        <div class="chat-message user-message">
+                            <div>{message[2]}</div>
+                            <div class="message-time">{timestamp}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        # File message
+                        st.markdown(f"""
+                        <div class="file-message" style="margin-left: auto; max-width: 70%;">
+                            <div><strong>📎 {message[5]}</strong></div>
+                            <div class="message-time">{timestamp}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        if message[4] and message[6] and 'image' in message[6]:
+                            # Display image
+                            try:
+                                image = Image.open(io.BytesIO(message[4]))
+                                st.image(image, caption=message[5], width=200)
+                            except:
+                                st.info("Could not display image")
                 else:
-                    st.markdown(f"""
-                    <div class="chat-message other-message">
-                        <strong>{message[1]}</strong>: {message[3]}
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # Other user's message
+                    if message[3] == 'text':
+                        st.markdown(f"""
+                        <div class="chat-message other-message">
+                            <div class="message-sender">{message[1]}</div>
+                            <div>{message[2]}</div>
+                            <div class="message-time">{timestamp}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        # File message
+                        st.markdown(f"""
+                        <div class="file-message" style="margin-right: auto; max-width: 70%;">
+                            <div class="message-sender">{message[1]}</div>
+                            <div><strong>📎 {message[5]}</strong></div>
+                            <div class="message-time">{timestamp}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        if message[4] and message[6] and 'image' in message[6]:
+                            # Display image
+                            try:
+                                image = Image.open(io.BytesIO(message[4]))
+                                st.image(image, caption=message[5], width=200)
+                            except:
+                                st.info("Could not display image")
             
-            # Send message
-            message_text = st.chat_input("Type your message...")
-            if message_text:
-                execute_query('''
-                    INSERT INTO messages (from_user, to_user, text)
-                    VALUES (?, ?, ?)
-                ''', (st.session_state.current_user['username'], st.session_state.current_chat_user, message_text))
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Chat input with emoji and file upload
+            col1, col2, col3 = st.columns([6, 1, 1])
+            with col1:
+                message_text = st.text_input("Type your message...", key="chat_input", label_visibility="collapsed")
+            with col2:
+                if st.button("😊", key="emoji_btn", use_container_width=True):
+                    st.session_state.show_emoji_picker = not st.session_state.show_emoji_picker
+                    st.rerun()
+            with col3:
+                uploaded_file = st.file_uploader("📎", type=['jpg', 'jpeg', 'png', 'gif', 'pdf', 'doc', 'docx', 'txt'], key="file_uploader", label_visibility="collapsed")
+            
+            # Emoji picker
+            if st.session_state.show_emoji_picker:
+                selected_emoji = render_emoji_picker()
+                if selected_emoji:
+                    st.session_state.chat_input = st.session_state.get('chat_input', '') + selected_emoji
+                    st.session_state.show_emoji_picker = False
+                    st.rerun()
+            
+            # Send message or file
+            if st.button("Send", use_container_width=True) and (message_text or uploaded_file):
+                if uploaded_file:
+                    # Handle file upload
+                    file_data = uploaded_file.read()
+                    file_name = uploaded_file.name
+                    file_type = uploaded_file.type
+                    
+                    execute_query('''
+                        INSERT INTO messages (from_user, to_user, text, message_type, file_data, file_name, file_type)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (st.session_state.current_user['username'], st.session_state.current_chat_user, 
+                          file_name, 'file', file_data, file_name, file_type))
+                elif message_text:
+                    # Handle text message
+                    execute_query('''
+                        INSERT INTO messages (from_user, to_user, text)
+                        VALUES (?, ?, ?)
+                    ''', (st.session_state.current_user['username'], st.session_state.current_chat_user, message_text))
+                
                 st.rerun()
+        else:
+            st.info("👈 Select a contact to start chatting")
 
 def render_group_chat():
     col1, col2 = st.columns([1, 2])
     
     with col1:
-        st.subheader("Chat Rooms")
+        st.subheader("🗨️ Chat Rooms")
         
         # Create new room
         with st.expander("➕ Create New Room"):
@@ -1039,11 +1421,12 @@ def render_group_chat():
     with col2:
         if st.session_state.current_chat_room:
             room = execute_query_one("SELECT * FROM chat_rooms WHERE id = ?", (st.session_state.current_chat_room,))
-            st.subheader(f"#{room[1]}")
+            st.markdown(f"<div class='chat-container'>", unsafe_allow_html=True)
+            st.subheader(f"🗨️ #{room[1]}")
             st.caption(room[2])
             
             # Room management for room creator or admin
-            if st.session_state.current_user['role'] == 'admin' or room[3] == st.session_state.current_user['username']:
+            if st.session_state.current_user['role'] in ['superadmin', 'admin'] or room[3] == st.session_state.current_user['username']:
                 with st.expander("👥 Manage Room Members"):
                     users = execute_query("SELECT * FROM users WHERE status = 'approved'", fetch=True)
                     for user in users:
@@ -1070,57 +1453,159 @@ def render_group_chat():
             ''', (st.session_state.current_chat_room,), fetch=True)
             
             for message in messages:
+                timestamp = message[8].split(' ')[1][:5] if message[8] else ''
+                
                 if message[1] == st.session_state.current_user['username']:
-                    st.markdown(f"""
-                    <div class="chat-message user-message">
-                        <strong>You</strong>: {message[3]}
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # User's message
+                    if message[3] == 'text':
+                        st.markdown(f"""
+                        <div class="chat-message user-message">
+                            <div>{message[2]}</div>
+                            <div class="message-time">{timestamp}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        # File message
+                        st.markdown(f"""
+                        <div class="file-message" style="margin-left: auto; max-width: 70%;">
+                            <div><strong>📎 {message[5]}</strong></div>
+                            <div class="message-time">{timestamp}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        if message[4] and message[6] and 'image' in message[6]:
+                            # Display image
+                            try:
+                                image = Image.open(io.BytesIO(message[4]))
+                                st.image(image, caption=message[5], width=200)
+                            except:
+                                st.info("Could not display image")
                 else:
-                    st.markdown(f"""
-                    <div class="chat-message other-message">
-                        <strong>{message[1]}</strong>: {message[3]}
-                    </div>
-                    """, unsafe_allow_html=True)
+                    # Other user's message
+                    if message[3] == 'text':
+                        st.markdown(f"""
+                        <div class="chat-message other-message">
+                            <div class="message-sender">{message[1]}</div>
+                            <div>{message[2]}</div>
+                            <div class="message-time">{timestamp}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        # File message
+                        st.markdown(f"""
+                        <div class="file-message" style="margin-right: auto; max-width: 70%;">
+                            <div class="message-sender">{message[1]}</div>
+                            <div><strong>📎 {message[5]}</strong></div>
+                            <div class="message-time">{timestamp}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        if message[4] and message[6] and 'image' in message[6]:
+                            # Display image
+                            try:
+                                image = Image.open(io.BytesIO(message[4]))
+                                st.image(image, caption=message[5], width=200)
+                            except:
+                                st.info("Could not display image")
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Group chat input with emoji and file upload
+            col1, col2, col3 = st.columns([6, 1, 1])
+            with col1:
+                message_text = st.text_input("Type your message to the group...", key="group_chat_input", label_visibility="collapsed")
+            with col2:
+                if st.button("😊", key="group_emoji_btn", use_container_width=True):
+                    st.session_state.show_emoji_picker = not st.session_state.show_emoji_picker
+                    st.rerun()
+            with col3:
+                uploaded_file = st.file_uploader("📎", type=['jpg', 'jpeg', 'png', 'gif', 'pdf', 'doc', 'docx', 'txt'], key="group_file_uploader", label_visibility="collapsed")
+            
+            # Emoji picker for group chat
+            if st.session_state.show_emoji_picker:
+                selected_emoji = render_emoji_picker()
+                if selected_emoji:
+                    st.session_state.group_chat_input = st.session_state.get('group_chat_input', '') + selected_emoji
+                    st.session_state.show_emoji_picker = False
+                    st.rerun()
             
             # Send message to group
-            message_text = st.chat_input("Type your message to the group...")
-            if message_text:
-                execute_query('''
-                    INSERT INTO group_messages (from_user, room_id, text)
-                    VALUES (?, ?, ?)
-                ''', (st.session_state.current_user['username'], st.session_state.current_chat_room, message_text))
+            if st.button("Send to Group", use_container_width=True) and (message_text or uploaded_file):
+                if uploaded_file:
+                    # Handle file upload
+                    file_data = uploaded_file.read()
+                    file_name = uploaded_file.name
+                    file_type = uploaded_file.type
+                    
+                    execute_query('''
+                        INSERT INTO group_messages (from_user, room_id, text, message_type, file_data, file_name, file_type)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (st.session_state.current_user['username'], st.session_state.current_chat_room, 
+                          file_name, 'file', file_data, file_name, file_type))
+                elif message_text:
+                    # Handle text message
+                    execute_query('''
+                        INSERT INTO group_messages (from_user, room_id, text)
+                        VALUES (?, ?, ?)
+                    ''', (st.session_state.current_user['username'], st.session_state.current_chat_room, message_text))
+                
                 st.rerun()
         else:
-            st.info("Select a chat room to start chatting")
+            st.info("👈 Select a chat room to start chatting")
 
 def render_settings():
     st.header("⚙️ Settings")
     
-    # Notification settings
-    st.subheader("🔔 Notification Settings")
-    notification_setting = st.selectbox("Notifications", ["All Notifications", "Important Only", "None"])
+    tab1, tab2, tab3 = st.tabs(["Change Password", "Notifications", "Contact Admin"])
     
-    # Language settings
-    language_setting = st.selectbox("Language", ["English", "Spanish", "French"])
-    
-    if st.button("Save Settings", use_container_width=True):
-        st.success("Settings saved successfully")
-    
-    # Contact admin
-    st.subheader("📞 Contact Admin")
-    with st.form("contact_admin_form", border=False):
-        subject = st.text_input("Subject")
-        message_text = st.text_area("Message")
+    with tab1:
+        st.subheader("🔐 Change Password")
         
-        if st.form_submit_button("Send Message to Admin", use_container_width=True):
-            # Create a message to admin
-            execute_query('''
-                INSERT INTO messages (from_user, to_user, text)
-                VALUES (?, ?, ?)
-            ''', (st.session_state.current_user['username'], 'admin', f'[CONTACT] Subject: {subject}\n\n{message_text}'))
+        with st.form("change_password_form", border=False):
+            current_password = st.text_input("Current Password", type="password")
+            new_password = st.text_input("New Password", type="password")
+            confirm_password = st.text_input("Confirm New Password", type="password")
             
-            st.success("Your message has been sent to admin")
+            if st.form_submit_button("Change Password", use_container_width=True):
+                if new_password != confirm_password:
+                    st.error("New passwords do not match")
+                elif len(new_password) < 6:
+                    st.error("Password must be at least 6 characters long")
+                else:
+                    success, message = change_password(
+                        st.session_state.current_user['username'],
+                        current_password,
+                        new_password
+                    )
+                    if success:
+                        st.success(message)
+                        # Update session state
+                        st.session_state.current_user['password'] = new_password
+                    else:
+                        st.error(message)
+    
+    with tab2:
+        st.subheader("🔔 Notification Settings")
+        notification_setting = st.selectbox("Notifications", ["All Notifications", "Important Only", "None"])
+        
+        # Language settings
+        language_setting = st.selectbox("Language", ["English", "Spanish", "French"])
+        
+        if st.button("Save Settings", use_container_width=True):
+            st.success("Settings saved successfully")
+    
+    with tab3:
+        st.subheader("📞 Contact Admin")
+        with st.form("contact_admin_form", border=False):
+            subject = st.text_input("Subject")
+            message_text = st.text_area("Message")
+            
+            if st.form_submit_button("Send Message to Admin", use_container_width=True):
+                # Create a message to admin
+                execute_query('''
+                    INSERT INTO messages (from_user, to_user, text)
+                    VALUES (?, ?, ?)
+                ''', (st.session_state.current_user['username'], 'admin', f'[CONTACT] Subject: {subject}\n\n{message_text}'))
+                
+                st.success("Your message has been sent to admin")
 
 def render_approvals():
     st.header("✅ Pending Approvals")
@@ -1128,129 +1613,171 @@ def render_approvals():
     current_user_role = st.session_state.current_user['role']
     approvable_roles = get_approvable_users(current_user_role)
     
-    if not approvable_roles:
+    if not approvable_roles and current_user_role != 'superadmin':
         st.warning("You don't have permission to approve any users.")
         return
     
-    # Pending user approvals - FIXED: Now properly shows users that current user can approve
-    st.subheader("👤 Pending User Registrations")
+    tab1, tab2, tab3 = st.tabs(["User Registrations", "Profile Changes", "Role Upgrades"])
     
-    if approvable_roles:
-        pending_users = execute_query(
-            "SELECT * FROM users WHERE status = 'pending' AND role IN ({})".format(
-                ','.join(['?'] * len(approvable_roles))
-            ), approvable_roles, fetch=True
-        )
-    else:
-        pending_users = []
-    
-    if pending_users:
-        for user in pending_users:
-            st.markdown(f"""
-            <div class="approval-item">
-                <h4>{user[2]} {user[3]} ({user[1]}) - {user[8]}</h4>
-                <p><strong>Email:</strong> {user[4]}</p>
-                <p><strong>Phone:</strong> {user[5]}</p>
-                <p><strong>ID Number:</strong> {user[6]}</p>
-                <p><strong>Registered:</strong> {user[10]}</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Approve", key=f"approve_{user[0]}", use_container_width=True):
-                    execute_query('UPDATE users SET status = ? WHERE id = ?', ('approved', user[0]))
-                    # Remove from pending approvals table
-                    execute_query('DELETE FROM pending_approvals WHERE user_id = ?', (user[0],))
-                    st.success(f"User {user[1]} approved successfully")
-                    st.rerun()
-            with col2:
-                if st.button("Reject", key=f"reject_{user[0]}", use_container_width=True):
-                    execute_query('UPDATE users SET status = ? WHERE id = ?', ('rejected', user[0]))
-                    # Remove from pending approvals table
-                    execute_query('DELETE FROM pending_approvals WHERE user_id = ?', (user[0],))
-                    st.success(f"User {user[1]} rejected")
-                    st.rerun()
-    else:
-        st.info("No pending user registrations")
-    
-    # Pending profile changes - FIXED: Now properly checks approval permissions
-    st.subheader("📝 Pending Profile Changes")
-    pending_changes = execute_query("SELECT * FROM pending_profile_changes", fetch=True)
-    
-    if pending_changes:
-        for change in pending_changes:
-            user = execute_query_one("SELECT * FROM users WHERE username = ?", (change[1],))
-            
-            if user and user[8] in approvable_roles:  # Only show if current user can approve this role
+    with tab1:
+        st.subheader("👤 Pending User Registrations")
+        
+        if approvable_roles or current_user_role == 'superadmin':
+            if current_user_role == 'superadmin':
+                pending_users = execute_query("SELECT * FROM users WHERE status = 'pending'", fetch=True)
+            else:
+                pending_users = execute_query(
+                    "SELECT * FROM users WHERE status = 'pending' AND role IN ({})".format(
+                        ','.join(['?'] * len(approvable_roles))
+                    ), approvable_roles, fetch=True
+                )
+        else:
+            pending_users = []
+        
+        if pending_users:
+            for user in pending_users:
                 st.markdown(f"""
                 <div class="approval-item">
-                    <h4>Profile changes for {change[1]}</h4>
-                    <p><strong>Current User:</strong> {user[2]} {user[3]} ({user[8]})</p>
-                    <p><strong>Proposed Changes:</strong></p>
+                    <h4>{user[2]} {user[3]} ({user[1]}) - {user[8]}</h4>
+                    <p><strong>Email:</strong> {user[4]}</p>
+                    <p><strong>Phone:</strong> {user[5]}</p>
+                    <p><strong>ID Number:</strong> {user[6]}</p>
+                    <p><strong>Registered:</strong> {user[10]}</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
-                if change[2]:
-                    st.write(f"- First Name: {change[2]}")
-                if change[3]:
-                    st.write(f"- Last Name: {change[3]}")
-                if change[4]:
-                    st.write(f"- Email: {change[4]}")
-                if change[5]:
-                    st.write(f"- Phone: {change[5]}")
-                if change[6]:
-                    st.write(f"- ID Number: {change[6]}")
-                if change[7]:
-                    st.write("- Password: *****")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Approve", key=f"approve_{user[0]}", use_container_width=True):
+                        execute_query('UPDATE users SET status = ? WHERE id = ?', ('approved', user[0]))
+                        # Remove from pending approvals table
+                        execute_query('DELETE FROM pending_approvals WHERE user_id = ?', (user[0],))
+                        st.success(f"User {user[1]} approved successfully")
+                        st.rerun()
+                with col2:
+                    if st.button("Reject", key=f"reject_{user[0]}", use_container_width=True):
+                        execute_query('UPDATE users SET status = ? WHERE id = ?', ('rejected', user[0]))
+                        # Remove from pending approvals table
+                        execute_query('DELETE FROM pending_approvals WHERE user_id = ?', (user[0],))
+                        st.success(f"User {user[1]} rejected")
+                        st.rerun()
+        else:
+            st.info("No pending user registrations")
+    
+    with tab2:
+        st.subheader("📝 Pending Profile Changes")
+        pending_changes = execute_query("SELECT * FROM pending_profile_changes", fetch=True)
+        
+        if pending_changes:
+            for change in pending_changes:
+                user = execute_query_one("SELECT * FROM users WHERE username = ?", (change[1],))
+                
+                if user and (current_user_role == 'superadmin' or user[8] in approvable_roles):
+                    st.markdown(f"""
+                    <div class="approval-item">
+                        <h4>Profile changes for {change[1]}</h4>
+                        <p><strong>Current User:</strong> {user[2]} {user[3]} ({user[8]})</p>
+                        <p><strong>Proposed Changes:</strong></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    if change[2]:
+                        st.write(f"- First Name: {change[2]}")
+                    if change[3]:
+                        st.write(f"- Last Name: {change[3]}")
+                    if change[4]:
+                        st.write(f"- Email: {change[4]}")
+                    if change[5]:
+                        st.write(f"- Phone: {change[5]}")
+                    if change[6]:
+                        st.write(f"- ID Number: {change[6]}")
+                    if change[7]:
+                        st.write("- Password: *****")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("Approve", key=f"approve_change_{change[0]}", use_container_width=True):
+                            # Apply changes
+                            update_fields = []
+                            update_values = []
+                            
+                            if change[2]:
+                                update_fields.append("first_name = ?")
+                                update_values.append(change[2])
+                            if change[3]:
+                                update_fields.append("last_name = ?")
+                                update_values.append(change[3])
+                            if change[4]:
+                                update_fields.append("email = ?")
+                                update_values.append(change[4])
+                            if change[5]:
+                                update_fields.append("phone = ?")
+                                update_values.append(change[5])
+                            if change[6]:
+                                update_fields.append("id_number = ?")
+                                update_values.append(change[6])
+                            if change[7]:
+                                update_fields.append("password = ?")
+                                update_values.append(change[7])
+                            
+                            update_values.append(change[1])
+                            
+                            if update_fields:
+                                execute_query(f'''
+                                    UPDATE users SET {', '.join(update_fields)} 
+                                    WHERE username = ?
+                                ''', update_values)
+                            
+                            # Remove pending change
+                            execute_query('DELETE FROM pending_profile_changes WHERE id = ?', (change[0],))
+                            
+                            st.success("Profile changes approved")
+                            st.rerun()
+                    with col2:
+                        if st.button("Reject", key=f"reject_change_{change[0]}", use_container_width=True):
+                            execute_query('DELETE FROM pending_profile_changes WHERE id = ?', (change[0],))
+                            st.success("Profile changes rejected")
+                            st.rerun()
+                    st.divider()
+        else:
+            st.info("No pending profile changes")
+    
+    with tab3:
+        st.subheader("🔼 Pending Role Upgrade Requests")
+        
+        pending_upgrades = get_pending_role_upgrades(current_user_role)
+        
+        if pending_upgrades:
+            for upgrade in pending_upgrades:
+                st.markdown(f"""
+                <div class="approval-item">
+                    <h4>Role Upgrade for {upgrade[8]} {upgrade[9]} ({upgrade[1]})</h4>
+                    <p><strong>Current Role:</strong> {upgrade[2]}</p>
+                    <p><strong>Requested Role:</strong> {upgrade[3]}</p>
+                    <p><strong>Reason:</strong> {upgrade[4] or 'No reason provided'}</p>
+                    <p><strong>Requested:</strong> {upgrade[7]}</p>
+                </div>
+                """, unsafe_allow_html=True)
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    if st.button("Approve", key=f"approve_change_{change[0]}", use_container_width=True):
-                        # Apply changes
-                        update_fields = []
-                        update_values = []
-                        
-                        if change[2]:
-                            update_fields.append("first_name = ?")
-                            update_values.append(change[2])
-                        if change[3]:
-                            update_fields.append("last_name = ?")
-                            update_values.append(change[3])
-                        if change[4]:
-                            update_fields.append("email = ?")
-                            update_values.append(change[4])
-                        if change[5]:
-                            update_fields.append("phone = ?")
-                            update_values.append(change[5])
-                        if change[6]:
-                            update_fields.append("id_number = ?")
-                            update_values.append(change[6])
-                        if change[7]:
-                            update_fields.append("password = ?")
-                            update_values.append(change[7])
-                        
-                        update_values.append(change[1])
-                        
-                        if update_fields:
-                            execute_query(f'''
-                                UPDATE users SET {', '.join(update_fields)} 
-                                WHERE username = ?
-                            ''', update_values)
-                        
-                        # Remove pending change
-                        execute_query('DELETE FROM pending_profile_changes WHERE id = ?', (change[0],))
-                        
-                        st.success("Profile changes approved")
+                    if st.button("Approve", key=f"approve_upgrade_{upgrade[0]}", use_container_width=True):
+                        success, message = approve_role_upgrade(upgrade[0], st.session_state.current_user['username'])
+                        if success:
+                            st.success(message)
+                        else:
+                            st.error(message)
                         st.rerun()
                 with col2:
-                    if st.button("Reject", key=f"reject_change_{change[0]}", use_container_width=True):
-                        execute_query('DELETE FROM pending_profile_changes WHERE id = ?', (change[0],))
-                        st.success("Profile changes rejected")
+                    if st.button("Reject", key=f"reject_upgrade_{upgrade[0]}", use_container_width=True):
+                        success, message = reject_role_upgrade(upgrade[0], st.session_state.current_user['username'])
+                        if success:
+                            st.success(message)
+                        else:
+                            st.error(message)
                         st.rerun()
-                st.divider()
-    else:
-        st.info("No pending profile changes")
+        else:
+            st.info("No pending role upgrade requests")
 
 # Main app
 def main():
@@ -1279,8 +1806,8 @@ def main():
             render_dashboard()
         elif st.session_state.current_page == 'profile':
             render_profile()
-        elif st.session_state.current_page == 'create_user':
-            render_create_user()
+        elif st.session_state.current_page == 'user_management':
+            render_user_management()
         elif st.session_state.current_page == 'products':
             render_products()
         elif st.session_state.current_page == 'orders':
